@@ -7,6 +7,9 @@ from bedrock.bedrock_client import BedrockClient
 from qdrant.qdrant_client import QdrantClient
 from neo4j.neo4j_client import Neo4jClient
 from config.settings import Settings
+from .document_loader import DocumentLoader, DocumentChunk
+from .models import Document
+from .graph_builder import GraphBuilder, EntityNode, Relationship
 
 logger = structlog.get_logger(__name__)
 
@@ -63,6 +66,17 @@ class NexusRAGSystem:
             max_connection_pool_size=settings.neo4j_max_connection_pool_size
         )
         
+        # Initialize document loader and graph builder
+        self.document_loader = DocumentLoader(
+            chunk_size=settings.chunk_size,
+            chunk_overlap=settings.chunk_overlap
+        )
+        
+        self.graph_builder = GraphBuilder(
+            llm_client=self.bedrock_client,
+            settings=settings
+        )
+        
         logger.info("NexusRAG system initialized")
     
     async def initialize(self):
@@ -95,6 +109,52 @@ class NexusRAGSystem:
         await self.neo4j_client.close()
         logger.info("NexusRAG system closed")
     
+    async def ingest_file(self, file_path: Union[str, Path]) -> bool:
+        """
+        Ingest a file (JSON or CSV) into the system.
+        
+        Args:
+            file_path: Path to the file to ingest
+            
+        Returns:
+            bool: True if ingestion was successful
+        """
+        try:
+            # Load and parse the document
+            docs = await self.document_loader.load_document(file_path)
+            
+            # Process each document in the file
+            for doc in docs:
+                # Generate a unique ID for the document
+                doc_id = str(uuid.uuid4())
+                
+                # 1. Perform document-level analysis
+                doc_document = Document(
+                    doc_id=doc_id,
+                    content=doc['content'],
+                    metadata=doc.get('metadata', {})
+                )
+                
+                # Store document-level entities and relationships
+                await self._process_document_graph(doc_document)
+                
+                # 2. Chunk the document for detailed analysis
+                chunks = self.document_loader.chunk_document(
+                    content=doc['content'],
+                    metadata=doc.get('metadata', {}),
+                    doc_id=doc_id
+                )
+                
+                # Process each chunk
+                for chunk in chunks:
+                    await self._process_chunk(chunk)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to ingest file {file_path}: {e}")
+            return False
+    
     async def ingest_documents(self, documents: List[Document]) -> bool:
         """
         Ingest documents into both vector and graph databases.
@@ -119,94 +179,168 @@ class NexusRAGSystem:
     async def _ingest_single_document(self, document: Document):
         """Ingest a single document."""
         # Chunk the document
-        chunks = self._chunk_document(document.content)
-        
-        # Generate embeddings for chunks
-        embeddings = await self.bedrock_client.generate_embeddings(
-            texts=chunks,
-            model_id=self.settings.embedding_model_id,
-            dimensions=self.settings.embedding_dimensions
+        chunks = self.document_loader.chunk_document(
+            content=document.content,
+            metadata=document.metadata,
+            doc_id=document.doc_id
         )
         
-        # Prepare vector payloads
-        payloads = []
-        for i, chunk in enumerate(chunks):
-            payload = {
-                "doc_id": document.doc_id,
-                "chunk_id": f"{document.doc_id}_chunk_{i}",
-                "content": chunk,
-                "chunk_index": i,
-                **document.metadata
-            }
-            payloads.append(payload)
-        
-        # Store in Qdrant
-        await self.qdrant_client.upsert_vectors(
-            collection_name=self.settings.qdrant_collection_name,
-            vectors=embeddings,
-            payloads=payloads
-        )
-        
-        # Store in Neo4j
-        await self._store_document_graph(document, chunks)
+        # Process each chunk
+        for chunk in chunks:
+            await self._process_chunk(chunk)
         
         logger.info("Document ingested", doc_id=document.doc_id, chunks=len(chunks))
     
-    def _chunk_document(self, content: str) -> List[str]:
-        """Simple document chunking."""
-        chunk_size = self.settings.chunk_size
-        chunk_overlap = self.settings.chunk_overlap
-        
-        chunks = []
-        start = 0
-        
-        while start < len(content):
-            end = start + chunk_size
-            chunk = content[start:end]
-            chunks.append(chunk)
-            start = end - chunk_overlap
+    async def _process_document_graph(self, document: Document) -> None:
+        """Process document-level graph construction."""
+        try:
+            # Analyze document-level content
+            nodes, relationships = await self.graph_builder.analyze_document(document)
             
-            if start >= len(content):
-                break
-        
-        return chunks
+            if nodes or relationships:
+                # Store document-level entities and relationships
+                await self._store_llm_graph(
+                    nodes=nodes,
+                    relationships=relationships,
+                    doc_id=document.doc_id,
+                    source="document"
+                )
+                
+        except Exception as e:
+            logger.error(f"Failed to process document-level graph for doc_id {document.doc_id}: {e}")
     
-    async def _store_document_graph(self, document: Document, chunks: List[str]):
-        """Store document and chunks in Neo4j graph."""
-        # Create document node
+    async def _process_chunk(self, chunk: DocumentChunk) -> None:
+        """Process a single document chunk."""
+        try:
+            # Generate embedding for the chunk
+            embedding = await self.bedrock_client.generate_embeddings(
+                text=chunk.content,
+                model_id=self.settings.embedding_model_id
+            )
+            
+            # Store in Qdrant
+            await self.qdrant_client.upsert(
+                collection_name=self.settings.qdrant_collection_name,
+                points=[{
+                    "id": chunk.chunk_id,
+                    "vector": embedding,
+                    "payload": {
+                        "text": chunk.content,
+                        "doc_id": chunk.doc_id,
+                        **chunk.metadata
+                    }
+                }]
+            )
+            
+            # Store in Neo4j with chunk-level analysis
+            await self._store_chunk_in_graph(chunk)
+            
+            logger.debug(f"Processed chunk {chunk.chunk_id}")
+            
+        except Exception as e:
+            logger.error(f"Failed to process chunk {chunk.chunk_id}: {e}")
+            raise
+    
+    async def _store_chunk_in_graph(self, chunk: DocumentChunk) -> None:
+        """
+        Store a document chunk in the Neo4j graph with chunk-level analysis.
+        """
+        try:
+            # Analyze chunk-level content
+            nodes, relationships = await self.graph_builder.analyze_chunk(chunk)
+            
+            if nodes or relationships:
+                # Store chunk-level entities and relationships
+                await self._store_llm_graph(
+                    nodes=nodes,
+                    relationships=relationships,
+                    doc_id=chunk.doc_id,
+                    source="chunk",
+                    chunk_id=chunk.chunk_id
+                )
+            
+            # Always store the basic chunk information
+            await self._store_basic_chunk(chunk)
+                
+        except Exception as e:
+            logger.error(f"Failed to store chunk with LLM analysis, falling back to basic storage: {e}")
+            await self._store_basic_chunk(chunk)
+    
+    async def _store_llm_graph(
+        self, 
+        nodes: List[EntityNode], 
+        relationships: List[Relationship],
+        doc_id: str,
+        source: str,
+        chunk_id: Optional[str] = None
+    ) -> None:
+        """Store LLM-extracted entities and relationships in Neo4j."""
+        # Create entity nodes
+        for node in nodes:
+            # Add source and doc_id to node properties
+            properties = {
+                **node.properties,
+                "doc_id": doc_id,
+                "source": source
+            }
+            
+            if chunk_id and source == "chunk":
+                properties["chunk_id"] = chunk_id
+            
+            await self.neo4j_client.create_node(
+                label=node.label,
+                properties=properties,
+                constraints=[node.id_field] if node.id_field in node.properties else None
+            )
+        
+        # Create relationships
+        for rel in relationships:
+            try:
+                await self.neo4j_client.create_relationship(
+                    start_node_label=rel.source_label,
+                    start_node_properties={rel.source_id_field: rel.source_id},
+                    end_node_label=rel.target_label,
+                    end_node_properties={rel.target_id_field: rel.target_id},
+                    relationship_type=rel.relationship_type,
+                    relationship_properties=rel.properties or {}
+                )
+            except Exception as e:
+                logger.warning(f"Failed to create relationship: {e}")
+    
+    async def _store_basic_chunk(self, chunk: DocumentChunk) -> None:
+        """Store basic chunk information in Neo4j."""
+        # Create document node if it doesn't exist
         await self.neo4j_client.create_node(
             label="Document",
             properties={
-                "doc_id": document.doc_id,
-                "content": document.content[:1000],  # Truncate for storage
-                **document.metadata
-            }
+                "doc_id": chunk.doc_id,
+                **chunk.metadata
+            },
+            constraints=["doc_id"]
         )
         
-        # Create chunk nodes and relationships
-        for i, chunk in enumerate(chunks):
-            chunk_id = f"{document.doc_id}_chunk_{i}"
-            
-            # Create chunk node
-            await self.neo4j_client.create_node(
-                label="Chunk",
-                properties={
-                    "chunk_id": chunk_id,
-                    "content": chunk,
-                    "chunk_index": i,
-                    "doc_id": document.doc_id
-                }
-            )
-            
-            # Create relationship between document and chunk
-            await self.neo4j_client.create_relationship(
-                start_node_label="Document",
-                start_node_properties={"doc_id": document.doc_id},
-                end_node_label="Chunk",
-                end_node_properties={"chunk_id": chunk_id},
-                relationship_type="HAS_CHUNK",
-                relationship_properties={"chunk_index": i}
-            )
+        # Create chunk node
+        await self.neo4j_client.create_node(
+            label="Chunk",
+            properties={
+                "chunk_id": chunk.chunk_id,
+                "content": chunk.content[:1000],  # Truncate for storage
+                "chunk_index": chunk.chunk_index,
+                "doc_id": chunk.doc_id,
+                "source": "chunk"
+            },
+            constraints=["chunk_id"]
+        )
+        
+        # Create relationship between document and chunk
+        await self.neo4j_client.create_relationship(
+            start_node_label="Document",
+            start_node_properties={"doc_id": chunk.doc_id},
+            end_node_label="Chunk",
+            end_node_properties={"chunk_id": chunk.chunk_id},
+            relationship_type="HAS_CHUNK",
+            relationship_properties={"chunk_index": chunk.chunk_index}
+        )
     
     async def query(
         self,
@@ -269,7 +403,7 @@ class NexusRAGSystem:
         results = []
         for result in search_results:
             results.append(RetrievalResult(
-                content=result["payload"]["content"],
+                content=result["payload"]["text"],
                 score=result["score"],
                 metadata=result["payload"],
                 source="vector"
@@ -390,12 +524,12 @@ class NexusRAGSystem:
         # Create prompt
         prompt = f"""Based on the following context, please answer the question.
 
-Context:
-{context}
+                Context:
+                {context}
 
-Question: {query}
+                Question: {query}
 
-Answer:"""
+                Answer:"""
         
         # Generate response using Bedrock
         response = await self.bedrock_client.generate_text(
