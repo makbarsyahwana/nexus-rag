@@ -117,40 +117,88 @@ class NexusRAGSystem:
             return False
     
     async def _ingest_single_document(self, document: Document):
-        """Ingest a single document."""
-        # Chunk the document
+        """
+        Process a single document through the complete ingestion pipeline:
+        1. Document Loading
+        2. Text Splitting
+        3. Embedding Generation
+        4. Vector Storage
+        5. Graph Construction
+        """
+        logger.info("Starting document ingestion", doc_id=document.doc_id)
+        
+        # 1. Document Loading (already done, document is passed as parameter)
+        logger.info("✅ Document loaded", doc_id=document.doc_id, 
+                   content_preview=document.content[:100] + "...")
+        
+        # 2. Text Splitting
         chunks = self._chunk_document(document.content)
+        logger.info("✅ Text split into chunks", doc_id=document.doc_id, 
+                   num_chunks=len(chunks))
         
-        # Generate embeddings for chunks
-        embeddings = await self.bedrock_client.generate_embeddings(
-            texts=chunks,
-            model_id=self.settings.embedding_model_id,
-            dimensions=self.settings.embedding_dimensions
-        )
-        
-        # Prepare vector payloads
-        payloads = []
+        # 3. Generate embeddings for each chunk
+        chunk_embeddings = []
         for i, chunk in enumerate(chunks):
-            payload = {
-                "doc_id": document.doc_id,
-                "chunk_id": f"{document.doc_id}_chunk_{i}",
-                "content": chunk,
-                "chunk_index": i,
-                **document.metadata
-            }
-            payloads.append(payload)
+            chunk_id = f"{document.doc_id}_chunk_{i}"
+            try:
+                # Generate embedding for the chunk
+                embedding = await self.bedrock_client.generate_embeddings(
+                    text=chunk,
+                    model_id=self.settings.embedding_model_id
+                )
+                chunk_embeddings.append({
+                    "id": chunk_id,
+                    "vector": embedding,
+                    "payload": {
+                        "text": chunk,
+                        "doc_id": document.doc_id,
+                        "chunk_index": i,
+                        **document.metadata
+                    }
+                })
+                logger.debug("Generated embedding for chunk", 
+                           chunk_id=chunk_id, 
+                           embedding_dim=len(embedding))
+            except Exception as e:
+                logger.error("Failed to generate embedding for chunk", 
+                            chunk_id=chunk_id, error=str(e))
+                continue
         
-        # Store in Qdrant
-        await self.qdrant_client.upsert_vectors(
-            collection_name=self.settings.qdrant_collection_name,
-            vectors=embeddings,
-            payloads=payloads
-        )
+        if not chunk_embeddings:
+            logger.error("No embeddings generated for document", doc_id=document.doc_id)
+            return
+            
+        logger.info("✅ Generated embeddings", 
+                   doc_id=document.doc_id, 
+                   num_embeddings=len(chunk_embeddings))
         
-        # Store in Neo4j
-        await self._store_document_graph(document, chunks)
+        # 4. Store vectors in Qdrant
+        try:
+            await self.qdrant_client.upsert(
+                collection_name=self.settings.qdrant_collection_name,
+                points=chunk_embeddings
+            )
+            logger.info("✅ Stored vectors in Qdrant", 
+                       doc_id=document.doc_id,
+                       collection=self.settings.qdrant_collection_name)
+        except Exception as e:
+            logger.error("Failed to store vectors in Qdrant", 
+                        doc_id=document.doc_id, error=str(e))
+            return
         
-        logger.info("Document ingested", doc_id=document.doc_id, chunks=len(chunks))
+        # 5. Build and store knowledge graph in Neo4j
+        try:
+            await self._store_document_graph(document, chunks)
+            logger.info("✅ Built knowledge graph in Neo4j", 
+                       doc_id=document.doc_id)
+        except Exception as e:
+            logger.error("Failed to build knowledge graph", 
+                        doc_id=document.doc_id, error=str(e))
+            return
+        
+        logger.info("✅ Document ingestion completed successfully", 
+                   doc_id=document.doc_id, 
+                   num_chunks=len(chunks))
     
     def _chunk_document(self, content: str) -> List[str]:
         """Simple document chunking."""
